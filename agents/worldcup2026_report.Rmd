@@ -1,0 +1,194 @@
+---
+title: "2026 FIFA World Cup: Country Statistics and Visualizations"
+author: "SICSS"
+date: "`r Sys.Date()`"
+output:
+  md_document:
+    variant: gfm
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  dpi = 120
+)
+
+library(tidyverse)
+library(rvest)
+library(janitor)
+library(knitr)
+library(scales)
+library(countrycode)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+```
+
+## Goal
+
+This report pulls publicly available data on the **2026 FIFA World Cup participating countries** from Wikipedia, processes it with tidyverse, and produces:
+
+1. A clean country-level summary table.
+2. A bar chart of FIFA rankings among qualified teams.
+3. A world map colored by FIFA ranking for those teams.
+
+## 1) Pull data from Wikipedia
+
+```{r pull-data}
+# Wikipedia page for 2026 FIFA World Cup
+wc_url <- "https://en.wikipedia.org/wiki/2026_FIFA_World_Cup"
+wc_page <- read_html(wc_url)
+
+# Read all tables and find the one containing qualified teams
+all_tables <- wc_page %>% html_table(fill = TRUE)
+
+qualified_raw <- all_tables %>%
+  keep(~ any(str_detect(names(.x), regex("Team|Qualified", ignore_case = TRUE))) &&
+         any(str_detect(unlist(.x[1:min(nrow(.x), 5), ], use.names = FALSE),
+                        regex("Qualified teams|Hosts|AFC|CAF|UEFA|CONMEBOL|CONCACAF|OFC", ignore_case = TRUE)))) %>%
+  .[[1]]
+
+# Standardize names
+qualified <- qualified_raw %>%
+  clean_names()
+
+qualified
+```
+
+## 2) Tidy and enrich data
+
+```{r tidy-data}
+# Attempt to identify columns robustly
+team_col <- names(qualified)[str_detect(names(qualified), "team|nation|country")][1]
+confed_col <- names(qualified)[str_detect(names(qualified), "confed|confederation|association")][1]
+appearance_col <- names(qualified)[str_detect(names(qualified), "appearance")][1]
+rank_col <- names(qualified)[str_detect(names(qualified), "rank")][1]
+
+# If rank column is unavailable, scrape FIFA ranking from another Wikipedia page (simple fallback)
+if (is.na(rank_col) || is.null(rank_col)) {
+  fifa_rank_url <- "https://en.wikipedia.org/wiki/FIFA_Men%27s_World_Ranking"
+  rank_page <- read_html(fifa_rank_url)
+  rank_tables <- rank_page %>% html_table(fill = TRUE)
+
+  rank_table <- rank_tables %>%
+    keep(~ any(str_detect(names(.x), regex("Team|Country|Association", ignore_case = TRUE))) &&
+           any(str_detect(names(.x), regex("Rank", ignore_case = TRUE)))) %>%
+    .[[1]] %>%
+    clean_names()
+
+  rank_team_col <- names(rank_table)[str_detect(names(rank_table), "team|country|association")][1]
+  rank_rank_col <- names(rank_table)[str_detect(names(rank_table), "rank")][1]
+
+  rank_df <- rank_table %>%
+    transmute(
+      team_name = .data[[rank_team_col]] %>% as.character() %>% str_remove_all("\\[.*?\\]") %>% str_trim(),
+      fifa_rank = parse_number(.data[[rank_rank_col]])
+    ) %>%
+    filter(!is.na(fifa_rank), !is.na(team_name), team_name != "")
+
+  wc_clean <- qualified %>%
+    transmute(
+      team_name = .data[[team_col]] %>% as.character() %>% str_remove_all("\\[.*?\\]") %>% str_trim(),
+      confederation = if (!is.na(confed_col)) .data[[confed_col]] else NA_character_,
+      appearances = if (!is.na(appearance_col)) parse_number(.data[[appearance_col]]) else NA_real_
+    ) %>%
+    filter(!is.na(team_name), team_name != "") %>%
+    distinct() %>%
+    left_join(rank_df, by = "team_name")
+
+} else {
+  wc_clean <- qualified %>%
+    transmute(
+      team_name = .data[[team_col]] %>% as.character() %>% str_remove_all("\\[.*?\\]") %>% str_trim(),
+      confederation = if (!is.na(confed_col)) .data[[confed_col]] else NA_character_,
+      appearances = if (!is.na(appearance_col)) parse_number(.data[[appearance_col]]) else NA_real_,
+      fifa_rank = parse_number(.data[[rank_col]])
+    ) %>%
+    filter(!is.na(team_name), team_name != "") %>%
+    distinct()
+}
+
+# Harmonize common country names for mapping and joins
+wc_clean <- wc_clean %>%
+  mutate(
+    team_name = recode(team_name,
+      "United States" = "United States",
+      "USA" = "United States",
+      "Korea Republic" = "South Korea",
+      "IR Iran" = "Iran",
+      "Côte d'Ivoire" = "Ivory Coast"
+    ),
+    iso3c = countrycode(team_name, origin = "country.name", destination = "iso3c")
+  )
+
+wc_clean
+```
+
+## 3) Country summary table
+
+```{r table}
+summary_table <- wc_clean %>%
+  arrange(fifa_rank) %>%
+  select(team_name, confederation, appearances, fifa_rank)
+
+kable(
+  summary_table,
+  caption = "Qualified 2026 World Cup teams: confederation, appearances, and FIFA ranking",
+  align = c("l", "l", "r", "r")
+)
+```
+
+## 4) Visualization 1: Bar chart of FIFA ranks
+
+```{r viz-bar}
+viz_data <- wc_clean %>%
+  filter(!is.na(fifa_rank)) %>%
+  arrange(fifa_rank) %>%
+  mutate(team_name = fct_reorder(team_name, -fifa_rank))
+
+ggplot(viz_data, aes(x = team_name, y = fifa_rank, fill = confederation)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_reverse() +
+  labs(
+    title = "FIFA rankings of 2026 World Cup participating teams",
+    x = "Country",
+    y = "FIFA Rank (lower is better)",
+    fill = "Confederation"
+  ) +
+  theme_minimal()
+```
+
+## 5) Visualization 2: World map colored by FIFA rank
+
+```{r viz-map}
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+map_data <- world %>%
+  left_join(wc_clean %>% select(iso3c, team_name, fifa_rank), by = c("iso_a3" = "iso3c"))
+
+ggplot(map_data) +
+  geom_sf(aes(fill = fifa_rank), color = "grey70", size = 0.1) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    direction = -1,
+    na.value = "grey92",
+    labels = label_number()
+  ) +
+  labs(
+    title = "2026 World Cup countries on world map",
+    subtitle = "Colored by FIFA ranking (NA = not in participating list)",
+    fill = "FIFA Rank"
+  ) +
+  theme_minimal()
+```
+
+## Notes
+
+- Source page for teams: <https://en.wikipedia.org/wiki/2026_FIFA_World_Cup>
+- Rankings are taken from the same table when available, with a fallback to FIFA ranking page scraping.
+- This document is designed to render as GitHub-flavored markdown.
